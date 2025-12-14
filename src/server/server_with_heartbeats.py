@@ -1,23 +1,27 @@
 import asyncio
 import json
 import socket
-import uuid
 import time
+import uuid
 from dataclasses import dataclass, asdict
-from typing import Dict, Optional, Set, List
+from typing import Dict, Optional, Set, List, Tuple
 
-# Client discovery
+# -----------------------------
+# Ports
+# -----------------------------
+# Client discovery: client broadcasts DISCOVER, server replies DISCOVER_REPLY
 DISCOVERY_PORT = 37020
 
 # Server control plane: membership + heartbeats (later election)
 SERVER_CONTROL_PORT = 37021
 
-# Membership gossip (leader)
-LEADER_GOSSIP_INTERVAL = 2.0
-
-# Heartbeats
-HEARTBEAT_INTERVAL = 1.0
-FAILURE_TIMEOUT = 4.0  # seconds without hearing from a server -> suspect failed
+# -----------------------------
+# Timers (seconds)
+# -----------------------------
+LEADER_GOSSIP_INTERVAL = 2.0         # leader gossips membership snapshot
+LEADER_HEARTBEAT_INTERVAL = 1.0      # leader -> followers
+FOLLOWER_ALIVE_INTERVAL = 1.0        # follower -> leader
+FAILURE_TIMEOUT = 5.0                # no message from peer within this window -> suspect failed
 
 
 def now() -> float:
@@ -25,8 +29,10 @@ def now() -> float:
 
 
 def get_local_ip() -> str:
+    """Return the LAN IP address that other devices can connect to."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
+        # No real traffic is sent; this selects the outbound interface.
         s.connect(("8.8.8.8", 80))
         return s.getsockname()[0]
     finally:
@@ -42,9 +48,21 @@ class ServerInfo:
 
 
 class ChatServer:
+    """
+    Server with:
+      - Client discovery over UDP (DISCOVER / DISCOVER_REPLY)
+      - Server-to-server membership discovery over UDP (SERVER_HELLO / SERVER_WELCOME / MEMBERSHIP)
+      - Heartbeat-based failure detection using *periodic beacons*, no ACKs:
+           * leader sends LEADER_HEARTBEAT periodically to all known servers
+           * each follower sends ALIVE periodically to leader
+      - Timeout-based suspicion/removal (crash-stop model)
+
+    Leader selection is currently deterministic (min server_id) until LCR election is added.
+    """
+
     def __init__(self, host: str, port: int):
-        self.host = host
-        self.port = port
+        self.host = host          # bind address for TCP chat
+        self.port = port          # TCP chat port
 
         self.server_id = str(uuid.uuid4())
         self.advertised_host = get_local_ip()
@@ -59,33 +77,29 @@ class ChatServer:
             )
         }
 
-        # last_seen timestamps for failure detection (include self)
+        # Liveness timestamps (updated when ANY control message is received from that server)
         self.last_seen: Dict[str, float] = {self.server_id: now()}
 
-        # Deterministic leader placeholder (until LCR)
+        # Deterministic leader placeholder (until LCR): lexicographically smallest id
         self.leader_id: str = self.server_id
         self._recompute_leader()
 
-        # TCP clients
+        # TCP clients for chat
         self.clients: Set[asyncio.StreamWriter] = set()
 
-        # UDP control socket (shared for send)
-        self._control_send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._control_send_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._control_send_sock.setblocking(False)
+        # A shared UDP socket for sending control messages (unicast)
+        self._ctrl_send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._ctrl_send_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._ctrl_send_sock.setblocking(False)
 
-    # ---------------- Utilities ----------------
+    # -----------------------------
+    # Membership helpers
+    # -----------------------------
     def _recompute_leader(self) -> None:
         self.leader_id = min(self.membership.keys())
 
-    def _print_membership(self) -> None:
-        leader = self.leader_id
-        servers = sorted(self.membership.values(), key=lambda s: s.id)
-        print(f"[MEMBERSHIP] me={self.server_id[:8]} leader={leader[:8]} servers={len(servers)}")
-        for s in servers:
-            role = " (LEADER)" if s.id == leader else ""
-            age = now() - self.last_seen.get(s.id, 0.0)
-            print(f"  - {s.id[:8]} {s.host}:{s.chat_port} ctrl:{s.control_port}{role} last_seen={age:0.1f}s ago")
+    def _touch(self, sid: str) -> None:
+        self.last_seen[sid] = now()
 
     def _serverinfo_from_dict(self, d: dict) -> Optional[ServerInfo]:
         try:
@@ -102,12 +116,11 @@ class ChatServer:
             "type": mtype,
             "leader_id": self.leader_id,
             "servers": [asdict(s) for s in self.membership.values()],
+            "ts": now(),
         }
 
-    def _touch(self, sid: str) -> None:
-        self.last_seen[sid] = now()
-
     def _merge_membership(self, servers: List[dict], leader_id: Optional[str]) -> bool:
+        """Merge a membership snapshot into our local view. Returns True if changed."""
         changed = False
 
         for s in servers:
@@ -119,7 +132,7 @@ class ChatServer:
                 self.membership[info.id] = info
                 changed = True
 
-            # seeing a server in a membership snapshot means it's likely alive recently
+            # Seeing a server in a membership snapshot suggests it's alive recently.
             if info.id not in self.last_seen:
                 self.last_seen[info.id] = now()
                 changed = True
@@ -133,13 +146,33 @@ class ChatServer:
 
         return changed
 
-    # ---------------- Main start ----------------
+    def _get_leader_endpoint(self) -> Optional[Tuple[str, int]]:
+        """Return (host, control_port) for current leader."""
+        info = self.membership.get(self.leader_id)
+        if not info:
+            return None
+        return info.host, info.control_port
+
+    def _print_membership(self) -> None:
+        leader = self.leader_id
+        servers = sorted(self.membership.values(), key=lambda s: s.id)
+        print(f"[MEMBERSHIP] me={self.server_id[:8]} leader={leader[:8]} servers={len(servers)}")
+        for s in servers:
+            role = " (LEADER)" if s.id == leader else ""
+            age = now() - self.last_seen.get(s.id, 0.0)
+            print(f"  - {s.id[:8]} {s.host}:{s.chat_port} ctrl:{s.control_port}{role} last_seen={age:0.1f}s ago")
+
+    # -----------------------------
+    # Startup
+    # -----------------------------
     async def start(self) -> None:
         asyncio.create_task(self.discovery_listener())
         asyncio.create_task(self.server_control_listener())
         asyncio.create_task(self.broadcast_server_hello())
+
         asyncio.create_task(self.leader_gossip_loop())
-        asyncio.create_task(self.heartbeat_loop())
+        asyncio.create_task(self.leader_heartbeat_loop())
+        asyncio.create_task(self.follower_alive_loop())
         asyncio.create_task(self.failure_detector_loop())
 
         server = await asyncio.start_server(self.handle_client, self.host, self.port)
@@ -152,7 +185,9 @@ class ChatServer:
         async with server:
             await server.serve_forever()
 
-    # ---------------- Client discovery (UDP) ----------------
+    # -----------------------------
+    # Client discovery (UDP)
+    # -----------------------------
     async def discovery_listener(self) -> None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -168,10 +203,16 @@ class ChatServer:
                 continue
 
             if msg.get("type") == "DISCOVER":
-                reply = {"type": "DISCOVER_REPLY", "server_host": self.advertised_host, "server_port": self.port}
+                reply = {
+                    "type": "DISCOVER_REPLY",
+                    "server_host": self.advertised_host,
+                    "server_port": self.port,
+                }
                 await loop.sock_sendto(sock, json.dumps(reply).encode("utf-8"), addr)
 
-    # ---------------- Server control (UDP) ----------------
+    # -----------------------------
+    # Server control plane (UDP)
+    # -----------------------------
     async def server_control_listener(self) -> None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -188,19 +229,21 @@ class ChatServer:
 
             mtype = msg.get("type")
 
+            # Any control-plane message proves the sender is alive (touch it)
+            sender_id = msg.get("from") or msg.get("id")
+            if isinstance(sender_id, str) and sender_id:
+                self._touch(sender_id)
+
             if mtype == "SERVER_HELLO":
                 info = self._serverinfo_from_dict(msg)
                 if info and info.id != self.server_id:
-                    # mark sender alive
-                    self._touch(info.id)
-
                     changed = False
                     if info.id not in self.membership or self.membership[info.id] != info:
                         self.membership[info.id] = info
                         changed = True
                         self._recompute_leader()
 
-                    # reply with our current view (any server can do this)
+                    # Reply from any server with its current view so joiner learns older members
                     welcome = self._membership_payload("SERVER_WELCOME")
                     await loop.sock_sendto(sock, json.dumps(welcome).encode("utf-8"), addr)
 
@@ -215,26 +258,19 @@ class ChatServer:
                     if changed:
                         self._print_membership()
 
-            elif mtype == "HEARTBEAT":
-                leader_id = str(msg.get("leader_id", ""))
-                sender_id = str(msg.get("from", ""))
+            elif mtype == "LEADER_HEARTBEAT":
+                # Followers receive this from leader; touching above already updated last_seen.
+                # Nothing else required.
+                pass
 
-                # mark leader/sender alive
-                if sender_id:
-                    self._touch(sender_id)
+            elif mtype == "ALIVE":
+                # Leader receives periodic ALIVE from followers; touching above already updated last_seen.
+                pass
 
-                # reply ACK back to the sender address
-                ack = {"type": "HEARTBEAT_ACK", "from": self.server_id}
-                await loop.sock_sendto(sock, json.dumps(ack).encode("utf-8"), addr)
-
-            elif mtype == "HEARTBEAT_ACK":
-                sender_id = str(msg.get("from", ""))
-                if sender_id:
-                    self._touch(sender_id)
-
-            # else: ignore unknown types for now (we’ll add election next)
+            # Ignore unknown types for now (we'll add election messages later)
 
     async def broadcast_server_hello(self) -> None:
+        """Broadcast our presence so other servers add us and reply with their views."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -247,10 +283,12 @@ class ChatServer:
             "host": self.advertised_host,
             "chat_port": self.port,
             "control_port": SERVER_CONTROL_PORT,
+            "from": self.server_id,  # unify sender field
         }
         payload = json.dumps(hello).encode("utf-8")
         bcast_addr = ("255.255.255.255", SERVER_CONTROL_PORT)
 
+        # Best-effort: send a few times to reduce loss
         for _ in range(3):
             try:
                 await loop.sock_sendto(sock, payload, bcast_addr)
@@ -260,7 +298,11 @@ class ChatServer:
 
         sock.close()
 
+    # -----------------------------
+    # Membership dissemination (leader gossip)
+    # -----------------------------
     async def leader_gossip_loop(self) -> None:
+        """Leader periodically unicasts the membership snapshot to all known servers."""
         await asyncio.sleep(1.0)
         loop = asyncio.get_running_loop()
 
@@ -277,47 +319,82 @@ class ChatServer:
                 if sid == self.server_id:
                     continue
                 try:
-                    await loop.sock_sendto(self._control_send_sock, payload, (sinfo.host, sinfo.control_port))
+                    await loop.sock_sendto(self._ctrl_send_sock, payload, (sinfo.host, sinfo.control_port))
                 except Exception:
                     pass
 
-    # ---------------- Heartbeats + failure detection ----------------
-    async def heartbeat_loop(self) -> None:
-        """Leader sends periodic heartbeats to all known servers."""
+    # -----------------------------
+    # Heartbeats (NO ACKs): periodic beacons
+    # -----------------------------
+    async def leader_heartbeat_loop(self) -> None:
+        """If I am leader, periodically send LEADER_HEARTBEAT to all known servers."""
         await asyncio.sleep(1.0)
         loop = asyncio.get_running_loop()
 
         while True:
-            await asyncio.sleep(HEARTBEAT_INTERVAL)
+            await asyncio.sleep(LEADER_HEARTBEAT_INTERVAL)
+
             if self.leader_id != self.server_id:
                 continue
 
-            hb = {"type": "HEARTBEAT", "leader_id": self.leader_id, "from": self.server_id, "ts": now()}
+            hb = {"type": "LEADER_HEARTBEAT", "from": self.server_id, "leader_id": self.leader_id, "ts": now()}
             payload = json.dumps(hb).encode("utf-8")
 
             for sid, sinfo in list(self.membership.items()):
                 if sid == self.server_id:
                     continue
                 try:
-                    await loop.sock_sendto(self._control_send_sock, payload, (sinfo.host, sinfo.control_port))
+                    await loop.sock_sendto(self._ctrl_send_sock, payload, (sinfo.host, sinfo.control_port))
                 except Exception:
                     pass
 
+    async def follower_alive_loop(self) -> None:
+        """If I am follower, periodically send ALIVE to leader (no ACK expected)."""
+        await asyncio.sleep(1.0)
+        loop = asyncio.get_running_loop()
+
+        while True:
+            await asyncio.sleep(FOLLOWER_ALIVE_INTERVAL)
+
+            if self.leader_id == self.server_id:
+                continue  # I'm leader; no need to send ALIVE
+
+            leader_ep = self._get_leader_endpoint()
+            if not leader_ep:
+                continue
+
+            msg = {"type": "ALIVE", "from": self.server_id, "leader_id": self.leader_id, "ts": now()}
+            payload = json.dumps(msg).encode("utf-8")
+
+            try:
+                await loop.sock_sendto(self._ctrl_send_sock, payload, leader_ep)
+            except Exception:
+                pass
+
+    # -----------------------------
+    # Failure detection
+    # -----------------------------
     async def failure_detector_loop(self) -> None:
-        """Remove servers not seen for FAILURE_TIMEOUT; detect leader suspicion."""
+        """
+        Timeout-based suspicion/removal (crash-stop model):
+          - Followers suspect leader if no heartbeat/control msg from leader within FAILURE_TIMEOUT
+          - Leader removes followers if no control msg from follower within FAILURE_TIMEOUT
+        """
+        await asyncio.sleep(2.0)
+
         while True:
             await asyncio.sleep(1.0)
 
-            # Leader suspicion for followers
+            # Followers: suspect leader
             if self.leader_id != self.server_id:
-                leader_last = self.last_seen.get(self.leader_id, 0.0)
-                if now() - leader_last > FAILURE_TIMEOUT:
-                    print(f"[FAILURE] Leader suspected failed: {self.leader_id[:8]} (no heartbeat).")
-                    # Election will be started here later (LCR)
-                    # For now just log.
+                last = self.last_seen.get(self.leader_id, 0.0)
+                if now() - last > FAILURE_TIMEOUT:
+                    print(f"[FAILURE] Leader suspected failed: {self.leader_id[:8]} (timeout).")
+                    # Next milestone: trigger LCR election here.
+                    # For now, we just log and wait for membership to update / future election.
 
-            # Remove failed servers (including old leader entries)
-            to_remove = []
+            # Leader: prune failed followers (and also prune any stale nodes)
+            to_remove: List[str] = []
             for sid in list(self.membership.keys()):
                 if sid == self.server_id:
                     continue
@@ -327,15 +404,17 @@ class ChatServer:
 
             if to_remove:
                 for sid in to_remove:
-                    info = self.membership.pop(sid, None)
+                    removed = self.membership.pop(sid, None)
                     self.last_seen.pop(sid, None)
-                    if info:
+                    if removed:
                         print(f"[FAILURE] Removing server {sid[:8]} from membership (timeout).")
 
                 self._recompute_leader()
                 self._print_membership()
 
-    # ---------------- TCP chat ----------------
+    # -----------------------------
+    # TCP chat (unchanged)
+    # -----------------------------
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self.clients.add(writer)
         peer = writer.get_extra_info("peername")
@@ -358,7 +437,7 @@ class ChatServer:
             print(f"[CLIENT] Disconnected: {peer}")
 
     async def broadcast_chat(self, msg: dict) -> None:
-        dead = []
+        dead: List[asyncio.StreamWriter] = []
         payload = (json.dumps(msg) + "\n").encode("utf-8")
         for w in self.clients:
             try:
@@ -373,7 +452,7 @@ class ChatServer:
 async def main() -> None:
     import argparse
     p = argparse.ArgumentParser()
-    p.add_argument("--host", default="0.0.0.0")
+    p.add_argument("--host", default="0.0.0.0")  # listen on all interfaces
     p.add_argument("--port", type=int, default=5001)
     args = p.parse_args()
 
