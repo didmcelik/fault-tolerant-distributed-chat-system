@@ -6,6 +6,16 @@ from common import read_json, write_json
 
 DISCOVERY_PORT = 37020
 
+
+def get_local_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    finally:
+        s.close()
+    return ip
+
 class ChatServer:
     def __init__(self, host: str, port: int):
         self.host = host
@@ -39,9 +49,10 @@ class ChatServer:
             if msg.get("type") == "DISCOVER":
                 reply = {
                     "type": "DISCOVER_REPLY",
-                    "server_host": self.host,
+                    "server_host": get_local_ip(),
                     "server_port": self.port
                 }
+
                 await loop.sock_sendto(
                     sock, json.dumps(reply).encode(), addr
                 )
@@ -72,6 +83,7 @@ class ChatServer:
                 dead.append(w)
         for w in dead:
             self.clients.remove(w)
+
 
 async def main():
     import argparse
