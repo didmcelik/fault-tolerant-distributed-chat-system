@@ -288,6 +288,7 @@ class ChatServer:
         """Start a Chang–Roberts (LCR) ring election."""
         self._elect_self_if_alone()
         if len(self.membership) <= 1:
+            # With a single node there is no ring; self-election is sufficient.
             return
 
         # Bump election term if we're not already running one.
@@ -296,7 +297,16 @@ class ChatServer:
             self.in_election = True
 
         succ = self._ring_successor_id()
+
+        # ---- LCR DEBUG LOGS (START) ----
+        print(
+            f"[ELECTION] Start LCR reason={reason} term={self._election_term} "
+            f"me={self.server_id[:8]} ring_size={len(self.membership)} successor={succ[:8] if succ else None}"
+        )
+        # ---- LCR DEBUG LOGS (END) ----
+
         if not succ:
+            # Ring successor unknown (should not happen if membership includes self).
             return
 
         msg = {
@@ -379,6 +389,10 @@ class ChatServer:
                 if term <= self.term:
                     continue
 
+                # ---- LCR DEBUG LOGS (RX ELECTION) ----
+                print(f"[ELECTION] RX ELECTION term={term} candidate={cand[:8]} at={self.server_id[:8]}")
+                # ---- LCR DEBUG LOGS (END) ----
+
                 self.in_election = True
                 self._election_term = max(self._election_term, term)
 
@@ -388,6 +402,11 @@ class ChatServer:
                     self.leader_id = self.server_id
                     self.in_election = False
                     self._last_elected = (self.term, self.leader_id)
+
+                    # ---- LCR DEBUG LOGS (WIN) ----
+                    print(f"[ELECTION] WIN leader={self.server_id[:8]} term={term} -> sending ELECTED")
+                    # ---- LCR DEBUG LOGS (END) ----
+
                     self._print_membership()
 
                     # Announce elected leader around the ring.
@@ -407,6 +426,10 @@ class ChatServer:
                 next_cand = cand if cand > self.server_id else self.server_id
                 succ = self._ring_successor_id()
                 if succ:
+                    # ---- LCR DEBUG LOGS (FWD ELECTION) ----
+                    print(f"[ELECTION] FWD ELECTION term={term} candidate={next_cand[:8]} -> succ={succ[:8]}")
+                    # ---- LCR DEBUG LOGS (END) ----
+
                     fwd = {
                         "type": "ELECTION",
                         "from": self.server_id,
@@ -432,6 +455,13 @@ class ChatServer:
 
                 already_seen = self._last_elected == (term, leader_id)
 
+                # ---- LCR DEBUG LOGS (RX ELECTED) ----
+                print(
+                    f"[ELECTION] RX ELECTED term={term} leader={leader_id[:8]} at={self.server_id[:8]} "
+                    f"already_seen={already_seen}"
+                )
+                # ---- LCR DEBUG LOGS (END) ----
+
                 self.term = term
                 if leader_id in self.membership:
                     self.leader_id = leader_id
@@ -445,10 +475,15 @@ class ChatServer:
 
                 # Forward until it returns to the elected leader.
                 if self.server_id == leader_id and already_seen:
-                    continue
+                    # Leader received its own ELECTED again -> stop.
+                    return
 
                 succ = self._ring_successor_id()
                 if succ:
+                    # ---- LCR DEBUG LOGS (FWD ELECTED) ----
+                    print(f"[ELECTION] FWD ELECTED term={term} leader={leader_id[:8]} -> succ={succ[:8]}")
+                    # ---- LCR DEBUG LOGS (END) ----
+
                     await self._send_control_to_server(
                         succ,
                         {
@@ -601,16 +636,17 @@ class ChatServer:
                     dead_leader = self.leader_id
                     self.membership.pop(dead_leader, None)
                     self.last_seen.pop(dead_leader, None)
-                    self._print_membership()
 
-                    # After removing suspected leader:
+                    # If we are now alone, immediately self-elect (2-node edge case).
                     if len(self.membership) == 1:
                         self.leader_id = self.server_id
                         self.in_election = False
                         self._election_term = 0
                         self._last_elected = (self.term, self.leader_id)
                         print("[ELECTION] Single node remaining; self-elected as leader.")
+                        self._print_membership()
                     else:
+                        self._print_membership()
                         await self._lcr_start_election(reason="leader_timeout")
 
             # Prune any failed peers (including followers if I'm leader)
