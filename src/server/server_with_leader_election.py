@@ -603,7 +603,15 @@ class ChatServer:
                     self.last_seen.pop(dead_leader, None)
                     self._print_membership()
 
-                    await self._lcr_start_election(reason="leader_timeout")
+                    # After removing suspected leader:
+                    if len(self.membership) == 1:
+                        self.leader_id = self.server_id
+                        self.in_election = False
+                        self._election_term = 0
+                        self._last_elected = (self.term, self.leader_id)
+                        print("[ELECTION] Single node remaining; self-elected as leader.")
+                    else:
+                        await self._lcr_start_election(reason="leader_timeout")
 
             # Prune any failed peers (including followers if I'm leader)
             to_remove: List[str] = []
