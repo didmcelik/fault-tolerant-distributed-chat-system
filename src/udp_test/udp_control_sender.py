@@ -1,7 +1,9 @@
 import socket
 import time
 
-TARGET_IP = "172.20.10.2"   # receiver IP
+
+#Didem ip 172.20.10.2
+TARGET_IP = "172.20.10.3"   # receiver IP
 CONTROL_PORT = 37021
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
