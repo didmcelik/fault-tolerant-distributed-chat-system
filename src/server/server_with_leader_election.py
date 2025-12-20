@@ -141,6 +141,7 @@ class ChatServer:
             self.leader_id = self.server_id
             self.in_election = False
             self._election_term = 0
+            self._last_elected = (self.term, self.leader_id)
 
     def _membership_payload(self, mtype: str) -> dict:
         return {
@@ -151,11 +152,11 @@ class ChatServer:
             "ts": now(),
         }
 
-    def _merge_membership(self, servers: List[dict], leader_id: Optional[str], term: Optional[int]) -> bool:
+    def _merge_membership(self, servers: List[dict], leader_id: Optional[str], term: Optional[object]) -> bool:
         """
         Merge a membership snapshot into our local view. Returns True if changed.
 
-        We also accept leader/term updates:
+        We accept leader/term updates:
           - Higher term always wins.
           - For the current term, adopt leader_id only if it exists in membership.
         """
@@ -170,7 +171,6 @@ class ChatServer:
                 self.membership[info.id] = info
                 changed = True
 
-            # Seeing a server in a membership snapshot suggests it's alive recently.
             if info.id not in self.last_seen:
                 self.last_seen[info.id] = now()
                 changed = True
@@ -178,7 +178,7 @@ class ChatServer:
         incoming_term: Optional[int] = None
         try:
             if term is not None:
-                incoming_term = int(term)
+                incoming_term = int(term)  # JSON may carry it as str/int
         except Exception:
             incoming_term = None
 
@@ -285,10 +285,14 @@ class ChatServer:
             pass
 
     async def _lcr_start_election(self, reason: str) -> None:
-        """Start a Chang–Roberts (LCR) ring election."""
-        self._elect_self_if_alone()
+        """
+        Start a Chang–Roberts (LCR) ring election.
+
+        IMPORTANT:
+          - This function assumes ring_size >= 2.
+          - Caller should NOT call this if membership size is 1.
+        """
         if len(self.membership) <= 1:
-            # With a single node there is no ring; self-election is sufficient.
             return
 
         # Bump election term if we're not already running one.
@@ -306,7 +310,6 @@ class ChatServer:
         # ---- LCR DEBUG LOGS (END) ----
 
         if not succ:
-            # Ring successor unknown (should not happen if membership includes self).
             return
 
         msg = {
@@ -348,9 +351,7 @@ class ChatServer:
                         self.membership[info.id] = info
                         changed = True
 
-                    self._elect_self_if_alone()
-
-                    # Reply from any server with its current view so joiner learns older members
+                    # Reply with current view so joiner learns older members
                     welcome = self._membership_payload("SERVER_WELCOME")
                     await loop.sock_sendto(sock, json.dumps(welcome).encode("utf-8"), addr)
 
@@ -385,7 +386,7 @@ class ChatServer:
                 if not isinstance(cand, str) or not cand:
                     continue
 
-                # Ignore stale elections.
+                # Ignore stale elections (drop this message, keep listener alive!)
                 if term <= self.term:
                     continue
 
@@ -409,7 +410,6 @@ class ChatServer:
 
                     self._print_membership()
 
-                    # Announce elected leader around the ring.
                     succ = self._ring_successor_id()
                     if succ:
                         elected = {
@@ -473,10 +473,10 @@ class ChatServer:
                 if not already_seen:
                     self._print_membership()
 
-                # Forward until it returns to the elected leader.
+                # If I'm the leader and I see the ELECTED announcement again, do NOT forward it,
+                # but keep the listener alive.
                 if self.server_id == leader_id and already_seen:
-                    # Leader received its own ELECTED again -> stop.
-                    return
+                    continue
 
                 succ = self._ring_successor_id()
                 if succ:
@@ -619,7 +619,7 @@ class ChatServer:
         Timeout-based suspected failure detection in an asynchronous system:
           - Followers suspect leader if no control msg from leader within FAILURE_TIMEOUT
           - Any server prunes peers if no control msg from that peer within FAILURE_TIMEOUT
-          - If the leader is removed/suspected, start an LCR election
+          - If the leader is removed/suspected, start an LCR election (only if ring_size >= 2)
         """
         await asyncio.sleep(2.0)
 
@@ -632,22 +632,19 @@ class ChatServer:
                 if now() - last > FAILURE_TIMEOUT:
                     print(f"[FAILURE] Leader suspected failed: {self.leader_id[:8]} (timeout).")
 
-                    # Remove suspected leader locally so the ring can progress.
                     dead_leader = self.leader_id
                     self.membership.pop(dead_leader, None)
                     self.last_seen.pop(dead_leader, None)
 
-                    # If we are now alone, immediately self-elect (2-node edge case).
+                    # If we are now alone, self-elect and DO NOT start election.
                     if len(self.membership) == 1:
-                        self.leader_id = self.server_id
-                        self.in_election = False
-                        self._election_term = 0
-                        self._last_elected = (self.term, self.leader_id)
+                        self._elect_self_if_alone()
                         print("[ELECTION] Single node remaining; self-elected as leader.")
                         self._print_membership()
-                    else:
-                        self._print_membership()
-                        await self._lcr_start_election(reason="leader_timeout")
+                        continue
+
+                    self._print_membership()
+                    await self._lcr_start_election(reason="leader_timeout")
 
             # Prune any failed peers (including followers if I'm leader)
             to_remove: List[str] = []
@@ -668,10 +665,15 @@ class ChatServer:
                     if sid == self.leader_id:
                         removed_leader = True
 
-                self._elect_self_if_alone()
+                # If only one server remains, just self-elect.
+                if len(self.membership) == 1:
+                    self._elect_self_if_alone()
+                    self._print_membership()
+                    continue
+
                 self._print_membership()
 
-                if removed_leader and len(self.membership) > 0:
+                if removed_leader and len(self.membership) > 1:
                     await self._lcr_start_election(reason="member_timeout")
 
     # -----------------------------
