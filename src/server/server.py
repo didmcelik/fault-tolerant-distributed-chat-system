@@ -5,6 +5,7 @@ import time
 import uuid
 from dataclasses import dataclass, asdict
 from typing import Dict, Optional, Set, List, Tuple
+import argparse
 
 DISCOVERY_PORT = 37020
 SERVER_CONTROL_PORT = 37021
@@ -41,13 +42,12 @@ class ServerInfo:
 
 class ChatServer:
     """
-    Example-style room isolation:
-      - Leader assigns a room to a server AND allocates a dedicated TCP port for that room on that server.
-      - Clients connect to the assigned server's room TCP port for chat traffic.
-      - Each room TCP server keeps its own client set -> no cross-room leakage.
+    Room isolation:
+      - Leader assigns room -> owner server + dedicated TCP room port.
+      - Clients connect to room port for chat traffic.
 
-    Causal ordering is implemented on the CLIENT (holdback + vector clocks),
-    so this server only forwards/broadcasts chat messages as they arrive.
+    Causal ordering is implemented in the CLIENT (holdback + vector clocks),
+    so the server only forwards/broadcasts chat messages as they arrive.
     """
 
     def __init__(self, host: str, port: int):
@@ -196,7 +196,7 @@ class ChatServer:
         self._room_clients[room] = set()
         print(f"[ROOM] Started room='{room}' TCP on {self.host}:{port}")
 
-    async def _handle_room_client(self, room: str, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def _handle_room_client(self, room, reader, writer):
         self._room_clients.setdefault(room, set()).add(writer)
         peer = writer.get_extra_info("peername")
         print(f"[ROOM] Client connected room='{room}' peer={peer}")
@@ -208,21 +208,19 @@ class ChatServer:
                     break
                 try:
                     msg = json.loads(line.decode("utf-8"))
-                except Exception:
+                except Exception as e:
+                    print(f"[ROOM] Bad JSON from {peer}: {e} line={line!r}")
                     continue
 
                 if msg.get("type") == "CHAT":
-                    # Enforce correct room tag for this room-port.
                     msg["room"] = room
                     await self._broadcast_room(room, msg)
+
+        except Exception as e:
+            print(f"[ROOM] Exception for {peer} in room='{room}': {repr(e)}")
+
         finally:
-            self._room_clients.get(room, set()).discard(writer)
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except Exception:
-                pass
-            print(f"[ROOM] Client disconnected room='{room}' peer={peer}")
+            ...
 
     async def _broadcast_room(self, room: str, msg: dict) -> None:
         payload = (json.dumps(msg) + "\n").encode("utf-8")
@@ -231,7 +229,8 @@ class ChatServer:
             try:
                 w.write(payload)
                 await w.drain()
-            except Exception:
+            except Exception as e:
+                print(f"[ROOM] Broadcast failed to {w.get_extra_info('peername')}: {repr(e)}")
                 dead.append(w)
         for w in dead:
             self._room_clients.get(room, set()).discard(w)
@@ -767,8 +766,6 @@ class ChatServer:
 
 
 async def main() -> None:
-    import argparse
-
     p = argparse.ArgumentParser()
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=5001, help="Coordinator TCP port")
@@ -780,3 +777,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+

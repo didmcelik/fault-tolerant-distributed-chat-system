@@ -11,6 +11,7 @@ RECONNECT_DELAY_SECONDS = 1.0
 MAX_QUEUE_SIZE = 200
 
 HOLD_BACK_TICK_SECONDS = 0.05
+MAX_HOLDBACK_SIZE = 2000  # safety guard
 
 
 def discover_server() -> Tuple[str, int]:
@@ -41,35 +42,50 @@ def _vc_get(vc: Dict[str, int], pid: str) -> int:
     return int(vc.get(pid, 0))
 
 
+def _parse_vc(raw: Any) -> Dict[str, int]:
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, int] = {}
+    for k, v in raw.items():
+        try:
+            out[str(k)] = int(v)
+        except Exception:
+            pass
+    return out
+
+
 def _vc_merge_max(local_vc: Dict[str, int], received_vc: Dict[str, int]) -> None:
     for pid, ts in received_vc.items():
-        try:
-            ts_i = int(ts)
-        except Exception:
-            continue
-        local_vc[pid] = max(int(local_vc.get(pid, 0)), ts_i)
+        local_vc[pid] = max(int(local_vc.get(pid, 0)), int(ts))
 
 
-def _is_deliverable(local_vc: Dict[str, int], sender_id: str, received_vc: Dict[str, int]) -> bool:
-    """
-    Classic causal delivery rule:
-      deliverable iff
-        received_vc[sender] == local_vc[sender] + 1
-        and for all k != sender: received_vc[k] <= local_vc[k]
-    """
+def _check_if_new_sender_and_fast_forward(local_vc: Dict[str, int], sender_id: str, received_vc: Dict[str, int]) -> bool:
+    # Example behavior for unseen senders (late join):
+    if not sender_id:
+        return False
+    if sender_id not in local_vc:
+        local_vc[sender_id] = _vc_get(received_vc, sender_id)
+        return True
+    return False
+
+
+def _fast_forward_on_gap(local_vc: Dict[str, int], sender_id: str, received_vc: Dict[str, int]) -> None:
+    # Pragmatic anti-deadlock rule when history is not replayed.
+    if not sender_id:
+        return
+    rv = _vc_get(received_vc, sender_id)
+    lv = _vc_get(local_vc, sender_id)
+    if rv > lv + 1:
+        local_vc[sender_id] = rv - 1
+
+
+def _is_deliverable_example_style(local_vc: Dict[str, int], sender_id: str, received_vc: Dict[str, int]) -> bool:
+    # Example-style sender-component only check:
     if not sender_id:
         return True
-
-    if _vc_get(received_vc, sender_id) != _vc_get(local_vc, sender_id) + 1:
-        return False
-
-    for pid, ts in received_vc.items():
-        if pid == sender_id:
-            continue
-        if _vc_get(received_vc, pid) > _vc_get(local_vc, pid):
-            return False
-
-    return True
+    lv = _vc_get(local_vc, sender_id)
+    rv = _vc_get(received_vc, sender_id)
+    return (lv + 1 == rv) or (lv == rv)
 
 
 class ClientApp:
@@ -77,18 +93,12 @@ class ClientApp:
         self.username = username
         self.room = room
 
-        # Stable process id (better than IP for reconnect / portability).
-        # The example uses IP as the key; this is the DS1-safe equivalent.
         self.client_id = str(uuid.uuid4())
-
-        # Vector clock stored in-memory (dict: pid -> int).
-        # Initialize own entry.
         self.vc: Dict[str, int] = {self.client_id: 0}
 
         self.outgoing_queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
         self._stop = False
 
-        # Hold-back queue (client-side causal ordering like the example project)
         self._holdback: List[dict] = []
         self._hb_lock = asyncio.Lock()
         self._holdback_task: Optional[asyncio.Task] = None
@@ -104,7 +114,7 @@ class ClientApp:
                 self._stop = True
                 break
 
-            # SEND event: increment own VC entry, attach snapshot (example-style)
+            # SEND: increment own clock and attach snapshot
             self.vc[self.client_id] = _vc_get(self.vc, self.client_id) + 1
 
             msg = {
@@ -113,7 +123,7 @@ class ClientApp:
                 "sender_id": self.client_id,
                 "room": self.room,
                 "text": text,
-                "vc": dict(self.vc),  # snapshot
+                "vc": dict(self.vc),
             }
 
             try:
@@ -122,14 +132,6 @@ class ClientApp:
                 print("[CLIENT] Outgoing queue full; dropping message.")
 
     async def join_via_coordinator(self) -> Tuple[str, int]:
-        """
-        Join via coordinator (leader):
-          - DISCOVER to get any coordinator endpoint
-          - JOIN_REQUEST(room)
-          - if REDIRECT -> connect to leader coordinator and retry
-          - expect JOIN_ASSIGN with assigned_host + assigned_room_port
-        Returns (assigned_host, assigned_room_port).
-        """
         host, port = discover_server()
         print(f"[CLIENT] Discovered coordinator at {host}:{port}")
 
@@ -187,7 +189,6 @@ class ClientApp:
             try:
                 await send_json_line(writer, msg)
             except Exception:
-                # Re-queue best-effort
                 try:
                     self.outgoing_queue.put_nowait(msg)
                 except asyncio.QueueFull:
@@ -195,68 +196,35 @@ class ClientApp:
                 raise
 
     async def _deliver_chat(self, msg: dict) -> None:
-        """
-        Deliver a chat message:
-          - merge VC via max (example updates local clock based on received)
-          - print
-        """
-        sender_id = str(msg.get("sender_id", ""))
-        received_vc = msg.get("vc")
-        if isinstance(received_vc, dict):
-            received_vc_int: Dict[str, int] = {}
-            for k, v in received_vc.items():
-                try:
-                    received_vc_int[str(k)] = int(v)
-                except Exception:
-                    pass
-
-            # RECEIVE merge: VC = max(VC, received_vc)
-            _vc_merge_max(self.vc, received_vc_int)
-
-            # Ensure sender entry is at least what we received (already covered by max)
-            if sender_id:
-                self.vc[sender_id] = max(_vc_get(self.vc, sender_id), _vc_get(received_vc_int, sender_id))
-
+        # RECEIVE event: increment own clock, merge, print
+        self.vc[self.client_id] = _vc_get(self.vc, self.client_id) + 1
+        received_vc = _parse_vc(msg.get("vc"))
+        _vc_merge_max(self.vc, received_vc)
         print(f"{msg.get('from', '?')}: {msg.get('text', '')}")
 
     async def _enqueue_holdback(self, msg: dict) -> None:
         async with self._hb_lock:
+            if len(self._holdback) >= MAX_HOLDBACK_SIZE:
+                self._holdback.pop(0)
+                print("[CLIENT] Holdback overflow; dropped oldest buffered message.")
             self._holdback.append(msg)
 
     async def _try_deliver_from_holdback_once(self) -> bool:
-        """
-        Try delivering any deliverable message from holdback.
-        Returns True if progress was made.
-        """
         async with self._hb_lock:
             for i, msg in enumerate(self._holdback):
                 sender_id = str(msg.get("sender_id", ""))
-                received_vc = msg.get("vc")
-                if not isinstance(received_vc, dict):
-                    # If no VC, deliver immediately
+                received_vc = _parse_vc(msg.get("vc"))
+
+                _check_if_new_sender_and_fast_forward(self.vc, sender_id, received_vc)
+                _fast_forward_on_gap(self.vc, sender_id, received_vc)
+
+                if _is_deliverable_example_style(self.vc, sender_id, received_vc):
                     self._holdback.pop(i)
                     await self._deliver_chat(msg)
                     return True
-
-                received_vc_int: Dict[str, int] = {}
-                for k, v in received_vc.items():
-                    try:
-                        received_vc_int[str(k)] = int(v)
-                    except Exception:
-                        pass
-
-                if _is_deliverable(self.vc, sender_id, received_vc_int):
-                    self._holdback.pop(i)
-                    await self._deliver_chat(msg)
-                    return True
-
         return False
 
     async def holdback_loop(self) -> None:
-        """
-        Example-style background processing:
-        keep checking holdback queue and deliver when possible.
-        """
         while not self._stop:
             progressed = await self._try_deliver_from_holdback_once()
             if not progressed:
@@ -266,35 +234,27 @@ class ClientApp:
         while not self._stop:
             msg = await read_json_line(reader)
             if msg is None:
+                print("[CLIENT] Room server disconnected (EOF).")
                 raise ConnectionError("Room server disconnected.")
 
             if msg.get("type") != "CHAT":
                 continue
             if msg.get("room") != self.room:
-                # Safety: ignore any cross-room traffic
                 continue
 
             sender_id = str(msg.get("sender_id", ""))
-            received_vc = msg.get("vc")
+            received_vc = _parse_vc(msg.get("vc"))
 
-            if not isinstance(received_vc, dict):
+            _check_if_new_sender_and_fast_forward(self.vc, sender_id, received_vc)
+            _fast_forward_on_gap(self.vc, sender_id, received_vc)
+
+            if _is_deliverable_example_style(self.vc, sender_id, received_vc):
                 await self._deliver_chat(msg)
-                continue
-
-            received_vc_int: Dict[str, int] = {}
-            for k, v in received_vc.items():
-                try:
-                    received_vc_int[str(k)] = int(v)
-                except Exception:
-                    pass
-
-            if _is_deliverable(self.vc, sender_id, received_vc_int):
-                await self._deliver_chat(msg)
-
-                # After delivering one message, try draining holdback as much as possible
                 while await self._try_deliver_from_holdback_once():
                     pass
             else:
+                # Buffering is treated as a local event in the example project
+                self.vc[self.client_id] = _vc_get(self.vc, self.client_id) + 1
                 await self._enqueue_holdback(msg)
 
     async def connection_loop(self) -> None:
@@ -302,7 +262,6 @@ class ClientApp:
             try:
                 reader, writer = await self.connect_room()
 
-                # Start holdback processing when connected (example starts it with output)
                 if self._holdback_task is None or self._holdback_task.done():
                     self._holdback_task = asyncio.create_task(self.holdback_loop())
 
@@ -317,7 +276,7 @@ class ClientApp:
             except Exception as e:
                 if self._stop:
                     break
-                print(f"[CLIENT] Connection lost/join failed: {e}")
+                print(f"[CLIENT] Connection lost/join failed: {repr(e)}")
                 print(f"[CLIENT] Reconnecting in {RECONNECT_DELAY_SECONDS:.1f}s...")
                 await asyncio.sleep(RECONNECT_DELAY_SECONDS)
 
