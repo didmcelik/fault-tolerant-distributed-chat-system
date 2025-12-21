@@ -220,7 +220,14 @@ class ChatServer:
             print(f"[ROOM] Exception for {peer} in room='{room}': {repr(e)}")
 
         finally:
-            ...
+            # Proper cleanup
+            self._room_clients.get(room, set()).discard(writer)
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+            print(f"[ROOM] Client disconnected room='{room}' peer={peer}")
 
     async def _broadcast_room(self, room: str, msg: dict) -> None:
         payload = (json.dumps(msg) + "\n").encode("utf-8")
@@ -697,6 +704,7 @@ class ChatServer:
     async def _handle_coordinator_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername")
         print(f"[COORD] Client connected: {peer}")
+        finished_join = False
 
         try:
             while True:
@@ -760,9 +768,11 @@ class ChatServer:
             writer.close()
             try:
                 await writer.wait_closed()
-            except Exception:
+            except Exception as e:
+                print(f"Exception: {repr(e)}")
                 pass
-            print(f"[COORD] Client disconnected: {peer}")
+            print(f"[COORD] JOIN finished (coordinator connection closed): {peer}")
+
 
 
 async def main() -> None:
