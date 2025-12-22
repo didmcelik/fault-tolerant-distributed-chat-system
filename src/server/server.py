@@ -267,18 +267,33 @@ class ChatServer:
 
         changed = False
 
+        # Track which server IDs are included in the incoming membership view
+        incoming_ids: Set[str] = set()
+
+        # 1) Merge/add servers from incoming list (no removals yet)
         if isinstance(servers, list):
             for s in servers:
                 info = self._serverinfo_from_dict(s)
-                if not info or info.id == self.server_id:
+                if not info:
                     continue
+                incoming_ids.add(info.id)
+
+                # Don't overwrite my own ServerInfo from the network
+                if info.id == self.server_id:
+                    continue
+
                 if info.id not in self.membership or self.membership[info.id] != info:
                     self.membership[info.id] = info
                     changed = True
+
                 if info.id not in self.last_seen:
                     self.last_seen[info.id] = now()
                     changed = True
 
+        # Always consider myself as part of any membership
+        incoming_ids.add(self.server_id)
+
+        # 2) Parse incoming term
         incoming_term: Optional[int] = None
         try:
             if term is not None:
@@ -286,28 +301,32 @@ class ChatServer:
         except Exception:
             incoming_term = None
 
+        # 3) Update term if newer
         if incoming_term is not None and incoming_term > self.term:
             self.term = incoming_term
             self.in_election = False
             self._election_term = 0
             changed = True
 
+        # 4) Update leader if consistent with our current term view
         if (
-            isinstance(leader_id, str)
-            and leader_id
-            and leader_id in self.membership
-            and leader_id != self.leader_id
-            and (incoming_term is None or incoming_term == self.term)
+                isinstance(leader_id, str)
+                and leader_id
+                and leader_id in self.membership
+                and leader_id != self.leader_id
+                and (incoming_term is None or incoming_term == self.term)
         ):
             self.leader_id = leader_id
             changed = True
 
+        # 5) Merge room ownership / ports / load for current-or-newer term
         if incoming_term is not None and incoming_term >= self.term:
             if isinstance(room_owner, dict):
                 filtered = {str(r): str(sid) for r, sid in room_owner.items() if str(sid) in self.membership}
                 if filtered != self.room_owner:
                     self.room_owner = filtered
                     changed = True
+
             if isinstance(room_port, dict):
                 new_ports: Dict[str, int] = {}
                 for r, p in room_port.items():
@@ -318,6 +337,7 @@ class ChatServer:
                 if new_ports and new_ports != self.room_port:
                     self.room_port = new_ports
                     changed = True
+
             if isinstance(server_load, dict):
                 new_load: Dict[str, int] = {}
                 for sid, v in server_load.items():
@@ -333,6 +353,38 @@ class ChatServer:
                         self.server_load = new_load
                         changed = True
 
+        # 6) ✅ PRUNE stale members using leader-authoritative membership (FIX)
+        # Followers do NOT timeout/prune other followers. Therefore convergence requires that
+        # followers remove members that disappear from the leader's membership list.
+        mtype = msg.get("type")
+        sender = msg.get("from") or msg.get("id")
+
+        # Authoritative if the message is a membership view coming from the leader for THIS term.
+        if (
+                mtype in ("MEMBERSHIP", "SERVER_WELCOME")
+                and isinstance(sender, str)
+                and isinstance(leader_id, str)
+                and sender == leader_id
+                and incoming_term is not None
+                and incoming_term == self.term
+        ):
+            stale_ids = [sid for sid in list(self.membership.keys()) if sid not in incoming_ids]
+            for sid in stale_ids:
+                # never remove myself
+                if sid == self.server_id:
+                    continue
+                self.membership.pop(sid, None)
+                self.last_seen.pop(sid, None)
+                self.server_load.pop(sid, None)
+                changed = True
+
+            # Rooms must not point to removed servers
+            filtered_rooms = {r: sid for r, sid in self.room_owner.items() if sid in self.membership}
+            if filtered_rooms != self.room_owner:
+                self.room_owner = filtered_rooms
+                changed = True
+
+        # 7) Final invariants
         self._elect_self_if_alone()
         self._ensure_load_entries()
         return changed
