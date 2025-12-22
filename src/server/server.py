@@ -446,7 +446,8 @@ class ChatServer:
 
             mtype = msg.get("type")
             sender_id = msg.get("from") or msg.get("id")
-            if isinstance(sender_id, str) and sender_id:
+            # Only update timestamps for direct communication, not gossip
+            if isinstance(sender_id, str) and sender_id and mtype in ("SERVER_HELLO", "LEADER_HEARTBEAT", "ALIVE", "ELECTION", "ELECTED"):
                 self._touch(sender_id)
 
             if mtype == "SERVER_HELLO":
@@ -584,6 +585,22 @@ class ChatServer:
             await asyncio.sleep(LEADER_GOSSIP_INTERVAL)
             if self.leader_id != self.server_id:
                 continue
+            # Clean up failed servers before gossiping
+            current_time = now()
+            to_remove = []
+            for sid in list(self.membership.keys()):
+                if sid == self.server_id:
+                    continue
+                last = self.last_seen.get(sid, 0.0)
+                if current_time - last > FAILURE_TIMEOUT:
+                    to_remove.append(sid)
+            
+            for sid in to_remove:
+                self.membership.pop(sid, None)
+                self.last_seen.pop(sid, None)
+                self.server_load.pop(sid, None)
+                self._reassign_rooms_from_dead_server(sid)
+            
             msg = self._membership_payload("MEMBERSHIP")
             payload = json.dumps(msg).encode("utf-8")
             for sid, sinfo in list(self.membership.items()):
