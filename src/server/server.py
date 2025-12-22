@@ -646,6 +646,9 @@ class ChatServer:
         while True:
             await asyncio.sleep(1.0)
 
+            # ---------------------------
+            # FOLLOWER: only suspect leader
+            # ---------------------------
             if self.leader_id != self.server_id and self.leader_id in self.membership:
                 last = self.last_seen.get(self.leader_id, 0.0)
                 if now() - last > FAILURE_TIMEOUT:
@@ -664,6 +667,12 @@ class ChatServer:
                     self._print_membership()
                     await self._lcr_start_election(reason="leader_timeout")
 
+                # ✅ CRITICAL FIX: followers must NOT prune other servers (leader is authoritative)
+                continue
+
+            # ---------------------------
+            # LEADER: prune timed-out members
+            # ---------------------------
             to_remove: List[str] = []
             for sid in list(self.membership.keys()):
                 if sid == self.server_id:
@@ -683,6 +692,7 @@ class ChatServer:
                     if sid == self.leader_id:
                         removed_leader = True
 
+                # Only the leader reassigns rooms
                 if self.leader_id == self.server_id:
                     for dead_sid in to_remove:
                         self._reassign_rooms_from_dead_server(dead_sid)
@@ -694,6 +704,8 @@ class ChatServer:
 
                 self._print_membership()
 
+                # If the leader was removed (shouldn't happen here because we're leader),
+                # keep the original behavior just in case.
                 if removed_leader and len(self.membership) > 1:
                     await self._lcr_start_election(reason="member_timeout")
 
