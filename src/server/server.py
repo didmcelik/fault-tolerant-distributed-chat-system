@@ -444,9 +444,17 @@ class ChatServer:
             except json.JSONDecodeError:
                 continue
 
+            # Always keep own timestamp fresh
+            self._touch(self.server_id)
+
             mtype = msg.get("type")
             sender_id = msg.get("from") or msg.get("id")
-            if isinstance(sender_id, str) and sender_id:
+            
+            # Only update timestamps for direct communication FROM other servers TO us
+            # Don't update for gossip or our own forwarded messages
+            if (isinstance(sender_id, str) and sender_id and 
+                sender_id != self.server_id and 
+                mtype in ("SERVER_HELLO", "LEADER_HEARTBEAT", "ALIVE", "ELECTION", "ELECTED")):
                 self._touch(sender_id)
 
             if mtype == "SERVER_HELLO":
@@ -645,6 +653,9 @@ class ChatServer:
         await asyncio.sleep(2.0)
         while True:
             await asyncio.sleep(1.0)
+
+            # Always keep own timestamp fresh
+            self._touch(self.server_id)
 
             # ---------------------------
             # FOLLOWER: only suspect leader
