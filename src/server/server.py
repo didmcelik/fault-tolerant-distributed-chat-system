@@ -649,11 +649,15 @@ class ChatServer:
             # ---------------------------
             # FOLLOWER: only suspect leader
             # ---------------------------
-            if self.leader_id != self.server_id and self.leader_id in self.membership:
+            if self.leader_id != self.server_id:
+                # NOTE: do NOT require "leader_id in membership" here.
+                # We can still time out a leader even if membership is in a weird intermediate state.
                 last = self.last_seen.get(self.leader_id, 0.0)
                 if now() - last > FAILURE_TIMEOUT:
                     print(f"[FAILURE] Leader suspected failed: {self.leader_id[:8]} (timeout).")
                     dead_leader = self.leader_id
+
+                    # Remove dead leader from local view so LCR ring excludes it
                     self.membership.pop(dead_leader, None)
                     self.last_seen.pop(dead_leader, None)
                     self.server_load.pop(dead_leader, None)
@@ -667,11 +671,11 @@ class ChatServer:
                     self._print_membership()
                     await self._lcr_start_election(reason="leader_timeout")
 
-                # ✅ CRITICAL FIX: followers must NOT prune other servers (leader is authoritative)
+                # ✅ CRITICAL: followers must NOT prune other servers
                 continue
 
             # ---------------------------
-            # LEADER: prune timed-out members
+            # LEADER: prune timed-out members (including dead old leaders)
             # ---------------------------
             to_remove: List[str] = []
             for sid in list(self.membership.keys()):
@@ -681,33 +685,24 @@ class ChatServer:
                 if now() - last > FAILURE_TIMEOUT:
                     to_remove.append(sid)
 
-            if to_remove:
-                removed_leader = False
-                for sid in to_remove:
-                    if sid in self.membership:
-                        print(f"[FAILURE] Removing server {sid[:8]} from membership (timeout).")
-                    self.membership.pop(sid, None)
-                    self.last_seen.pop(sid, None)
-                    self.server_load.pop(sid, None)
-                    if sid == self.leader_id:
-                        removed_leader = True
+            if not to_remove:
+                continue
 
-                # Only the leader reassigns rooms
-                if self.leader_id == self.server_id:
-                    for dead_sid in to_remove:
-                        self._reassign_rooms_from_dead_server(dead_sid)
+            for sid in to_remove:
+                if sid in self.membership:
+                    print(f"[FAILURE] Removing server {sid[:8]} from membership (timeout).")
+                self.membership.pop(sid, None)
+                self.last_seen.pop(sid, None)
+                self.server_load.pop(sid, None)
 
-                if len(self.membership) == 1:
-                    self._elect_self_if_alone()
-                    self._print_membership()
-                    continue
+            # Leader-only coordinator work
+            for dead_sid in to_remove:
+                self._reassign_rooms_from_dead_server(dead_sid)
 
-                self._print_membership()
+            if len(self.membership) == 1:
+                self._elect_self_if_alone()
 
-                # If the leader was removed (shouldn't happen here because we're leader),
-                # keep the original behavior just in case.
-                if removed_leader and len(self.membership) > 1:
-                    await self._lcr_start_election(reason="member_timeout")
+            self._print_membership()
 
     async def _send_tcp(self, writer: asyncio.StreamWriter, msg: dict) -> None:
         writer.write((json.dumps(msg) + "\n").encode("utf-8"))
