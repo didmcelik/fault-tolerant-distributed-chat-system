@@ -220,7 +220,6 @@ class ChatServer:
             print(f"[ROOM] Exception for {peer} in room='{room}': {repr(e)}")
 
         finally:
-            # Proper cleanup
             self._room_clients.get(room, set()).discard(writer)
             try:
                 writer.close()
@@ -246,8 +245,10 @@ class ChatServer:
     # Membership payload
     # -----------------------------
     def _membership_payload(self, mtype: str) -> dict:
+        # Include "from" so followers can treat leader snapshots as authoritative
         return {
             "type": mtype,
+            "from": self.server_id,
             "leader_id": self.leader_id,
             "term": self.term,
             "servers": [asdict(s) for s in self.membership.values()],
@@ -266,19 +267,12 @@ class ChatServer:
         server_load = msg.get("server_load")
 
         changed = False
+        incoming_ids: Set[str] = set()
 
-        if isinstance(servers, list):
-            for s in servers:
-                info = self._serverinfo_from_dict(s)
-                if not info or info.id == self.server_id:
-                    continue
-                if info.id not in self.membership or self.membership[info.id] != info:
-                    self.membership[info.id] = info
-                    changed = True
-                if info.id not in self.last_seen:
-                    self.last_seen[info.id] = now()
-                    changed = True
+        mtype = msg.get("type")
+        sender = msg.get("from") or msg.get("id")
 
+        # 1) Parse incoming term early
         incoming_term: Optional[int] = None
         try:
             if term is not None:
@@ -286,28 +280,58 @@ class ChatServer:
         except Exception:
             incoming_term = None
 
+        # 2) Merge/add servers from incoming list (no removals yet)
+        if isinstance(servers, list):
+            for s in servers:
+                info = self._serverinfo_from_dict(s)
+                if not info:
+                    continue
+
+                incoming_ids.add(info.id)
+
+                # Do not overwrite my own ServerInfo from the network
+                if info.id == self.server_id:
+                    continue
+
+                if info.id not in self.membership or self.membership[info.id] != info:
+                    self.membership[info.id] = info
+                    changed = True
+
+                if info.id not in self.last_seen:
+                    self.last_seen[info.id] = now()
+                    changed = True
+
+        incoming_ids.add(self.server_id)
+
+        # 3) If term is newer, adopt it and clear election state
         if incoming_term is not None and incoming_term > self.term:
             self.term = incoming_term
             self.in_election = False
             self._election_term = 0
             changed = True
 
+        # 4) FIX: Update leader ONLY from authoritative leader-issued snapshots.
+        # Prevents followers from adopting a stale/incorrect leader_id from random senders.
         if (
-            isinstance(leader_id, str)
-            and leader_id
-            and leader_id in self.membership
+            mtype in ("MEMBERSHIP", "SERVER_WELCOME")
+            and isinstance(sender, str)
+            and isinstance(leader_id, str)
+            and sender == leader_id
+            and incoming_term is not None
+            and incoming_term >= self.term
             and leader_id != self.leader_id
-            and (incoming_term is None or incoming_term == self.term)
         ):
             self.leader_id = leader_id
             changed = True
 
+        # 5) Merge room ownership / ports / load for current-or-newer term
         if incoming_term is not None and incoming_term >= self.term:
             if isinstance(room_owner, dict):
                 filtered = {str(r): str(sid) for r, sid in room_owner.items() if str(sid) in self.membership}
                 if filtered != self.room_owner:
                     self.room_owner = filtered
                     changed = True
+
             if isinstance(room_port, dict):
                 new_ports: Dict[str, int] = {}
                 for r, p in room_port.items():
@@ -318,6 +342,7 @@ class ChatServer:
                 if new_ports and new_ports != self.room_port:
                     self.room_port = new_ports
                     changed = True
+
             if isinstance(server_load, dict):
                 new_load: Dict[str, int] = {}
                 for sid, v in server_load.items():
@@ -332,6 +357,32 @@ class ChatServer:
                     if new_load != self.server_load:
                         self.server_load = new_load
                         changed = True
+
+        # 6) Prune stale members using leader-authoritative membership snapshots
+        if (
+            mtype in ("MEMBERSHIP", "SERVER_WELCOME")
+            and isinstance(sender, str)
+            and sender == self.leader_id
+            and incoming_term is not None
+            and incoming_term == self.term
+        ):
+            stale_ids = [sid for sid in list(self.membership.keys()) if sid not in incoming_ids]
+            for sid in stale_ids:
+                if sid == self.server_id:
+                    continue
+                self.membership.pop(sid, None)
+                self.last_seen.pop(sid, None)
+                self.server_load.pop(sid, None)
+                changed = True
+
+            filtered_rooms = {r: sid for r, sid in self.room_owner.items() if sid in self.membership}
+            if filtered_rooms != self.room_owner:
+                self.room_owner = filtered_rooms
+                changed = True
+
+            self.room_port = {r: p for r, p in self.room_port.items() if r in self.room_owner}
+            self.server_load = {sid: v for sid, v in self.server_load.items() if sid in self.membership}
+            self.server_load.setdefault(self.server_id, self.server_load.get(self.server_id, 0))
 
         self._elect_self_if_alone()
         self._ensure_load_entries()
@@ -400,7 +451,7 @@ class ChatServer:
             pass
 
     # -----------------------------
-    # LCR election (unchanged)
+    # LCR election
     # -----------------------------
     async def _lcr_start_election(self, reason: str) -> None:
         if len(self.membership) <= 1:
@@ -530,9 +581,9 @@ class ChatServer:
                 already_seen = self._last_elected == (term, leader_id)
                 print(f"[ELECTION] RX ELECTED term={term} leader={leader_id[:8]} at={self.server_id[:8]} already_seen={already_seen}")
 
+                # Always adopt elected leader for this term (no membership check)
                 self.term = term
-                if leader_id in self.membership:
-                    self.leader_id = leader_id
+                self.leader_id = leader_id
                 self.in_election = False
                 self._election_term = 0
                 self._last_elected = (term, leader_id)
@@ -650,14 +701,12 @@ class ChatServer:
             # FOLLOWER: only suspect leader
             # ---------------------------
             if self.leader_id != self.server_id:
-                # NOTE: do NOT require "leader_id in membership" here.
-                # We can still time out a leader even if membership is in a weird intermediate state.
                 last = self.last_seen.get(self.leader_id, 0.0)
                 if now() - last > FAILURE_TIMEOUT:
                     print(f"[FAILURE] Leader suspected failed: {self.leader_id[:8]} (timeout).")
                     dead_leader = self.leader_id
 
-                    # Remove dead leader from local view so LCR ring excludes it
+                    # Remove dead leader from local view so the election ring excludes it
                     self.membership.pop(dead_leader, None)
                     self.last_seen.pop(dead_leader, None)
                     self.server_load.pop(dead_leader, None)
@@ -671,11 +720,11 @@ class ChatServer:
                     self._print_membership()
                     await self._lcr_start_election(reason="leader_timeout")
 
-                # ✅ CRITICAL: followers must NOT prune other servers
+                # Followers must NOT prune other servers
                 continue
 
             # ---------------------------
-            # LEADER: prune timed-out members (including dead old leaders)
+            # LEADER: prune timed-out members
             # ---------------------------
             to_remove: List[str] = []
             for sid in list(self.membership.keys()):
@@ -695,7 +744,6 @@ class ChatServer:
                 self.last_seen.pop(sid, None)
                 self.server_load.pop(sid, None)
 
-            # Leader-only coordinator work
             for dead_sid in to_remove:
                 self._reassign_rooms_from_dead_server(dead_sid)
 
@@ -711,7 +759,6 @@ class ChatServer:
     async def _handle_coordinator_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername")
         print(f"[COORD] Client connected: {peer}")
-        finished_join = False
 
         try:
             while True:
@@ -777,9 +824,7 @@ class ChatServer:
                 await writer.wait_closed()
             except Exception as e:
                 print(f"Exception: {repr(e)}")
-                pass
             print(f"[COORD] JOIN finished (coordinator connection closed): {peer}")
-
 
 
 async def main() -> None:
@@ -794,4 +839,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-
