@@ -36,8 +36,8 @@ def get_local_ip() -> str:
 class ServerInfo:
     id: str
     host: str
-    chat_port: int
-    control_port: int = SERVER_CONTROL_PORT
+    chat_port: int # coordinator TCP port for client interaction
+    control_port: int = SERVER_CONTROL_PORT # UDP port for server control messages
 
 
 class ChatServer:
@@ -74,13 +74,14 @@ class ChatServer:
         self._election_term: int = 0
         self._last_elected: Optional[Tuple[int, str]] = None
 
-        self.room_owner: Dict[str, str] = {}
-        self.room_port: Dict[str, int] = {}
-        self.server_load: Dict[str, int] = {self.server_id: 0}
+        self.room_owner: Dict[str, str] = {} # room : owner server_id
+        self.room_port: Dict[str, int] = {} # room : TCP port
+        self.server_load: Dict[str, int] = {self.server_id: 0} # server_id : num of rooms hosted
 
         self._room_servers: Dict[str, asyncio.base_events.Server] = {}
         self._room_clients: Dict[str, Set[asyncio.StreamWriter]] = {}
 
+        # UDP socket for sending control messages to other servers
         self._ctrl_send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._ctrl_send_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._ctrl_send_sock.setblocking(False)
@@ -121,16 +122,19 @@ class ChatServer:
             self._election_term = 0
             self._last_elected = (self.term, self.leader_id)
 
+    # Every server in membership should have an entry in server_load dict
     def _ensure_load_entries(self) -> None:
         for sid in self.membership.keys():
             self.server_load.setdefault(sid, 0)
 
+    # Get coordinator TCP port of current leader
     def _leader_endpoint(self) -> Optional[Tuple[str, int]]:
         info = self.membership.get(self.leader_id)
         if not info:
             return None
         return info.host, info.chat_port
 
+    # Get control UDP port of current leader
     def _get_leader_control_endpoint(self) -> Optional[Tuple[str, int]]:
         info = self.membership.get(self.leader_id)
         if not info:
@@ -154,39 +158,52 @@ class ChatServer:
                 print(f"  - room='{r}' owner={owner[:8]} port={port}")
 
     def _choose_server_for_room(self, room: str) -> str:
+        # If room already has an owner, return it
         if room in self.room_owner and self.room_owner[room] in self.membership:
             return self.room_owner[room]
         self._ensure_load_entries()
         alive_ids = list(self.membership.keys())
+        # Pick the server with the least load (tiebreaker: lowest ID)
         chosen = min(alive_ids, key=lambda sid: (self.server_load.get(sid, 0), sid))
         self.room_owner[room] = chosen
         return chosen
 
     def _ensure_room_port_assigned(self, room: str, owner_sid: str) -> int:
+        """
+        Assign a unique TCP port for each room
+        """
         if room in self.room_port:
             return self.room_port[room]
 
+        # Generate port from room hash
         port = ROOM_PORT_BASE + (abs(hash(room)) % (ROOM_PORT_MAX - ROOM_PORT_BASE + 1))
         shift = 0
         while True:
             candidate = port + shift
+            # If exceeded max, wrap around to stay in range
             if candidate > ROOM_PORT_MAX:
                 candidate = ROOM_PORT_BASE + (candidate - ROOM_PORT_MAX - 1)
+            # Avoid conflict with coordinator port
             if candidate != self.port:
                 self.room_port[room] = candidate
                 return candidate
             shift += 1
 
     async def _ensure_local_room_server(self, room: str) -> None:
+        """
+        Create TCP server for the given room (if this server is the owner)
+        """
         if self.room_owner.get(room) != self.server_id:
             return
         if room in self._room_servers:
             return
 
+        # Get assigned port
         port = self.room_port.get(room)
         if not isinstance(port, int):
             return
 
+        # Start TCP server for this room
         srv = await asyncio.start_server(
             lambda r, w: self._handle_room_client(room, r, w),
             self.host,
@@ -197,11 +214,15 @@ class ChatServer:
         print(f"[ROOM] Started room='{room}' TCP on {self.host}:{port}")
 
     async def _handle_room_client(self, room, reader, writer):
+        """
+        Manages individual chat client connections to a room
+        """
         self._room_clients.setdefault(room, set()).add(writer)
         peer = writer.get_extra_info("peername")
         print(f"[ROOM] Client connected room='{room}' peer={peer}")
 
         try:
+            # Read messages from client and broadcast to room
             while True:
                 line = await reader.readline()
                 if not line:
@@ -220,6 +241,7 @@ class ChatServer:
             print(f"[ROOM] Exception for {peer} in room='{room}': {repr(e)}")
 
         finally:
+            # Clean up on disconnect
             self._room_clients.get(room, set()).discard(writer)
             try:
                 writer.close()
@@ -229,7 +251,7 @@ class ChatServer:
             print(f"[ROOM] Client disconnected room='{room}' peer={peer}")
 
     async def _broadcast_room(self, room: str, msg: dict) -> None:
-        payload = (json.dumps(msg) + "\n").encode("utf-8")
+        payload = (json.dumps(msg) + "\n").encode("utf-8") # serialize message
         dead: List[asyncio.StreamWriter] = []
         for w in list(self._room_clients.get(room, set())):
             try:
@@ -241,10 +263,10 @@ class ChatServer:
         for w in dead:
             self._room_clients.get(room, set()).discard(w)
 
-    # -----------------------------
-    # Membership payload
-    # -----------------------------
     def _membership_payload(self, mtype: str) -> dict:
+        """ 
+        Creates a membership snapshot
+        """
         # Include "from" so followers can treat leader snapshots as authoritative
         return {
             "type": mtype,
@@ -259,6 +281,7 @@ class ChatServer:
         }
 
     def _merge_membership(self, msg: dict) -> bool:
+        # Extract incoming data
         servers = msg.get("servers", [])
         leader_id = msg.get("leader_id")
         term = msg.get("term")
@@ -272,7 +295,7 @@ class ChatServer:
         mtype = msg.get("type")
         sender = msg.get("from") or msg.get("id")
 
-        # 1) Parse incoming term early
+        # Parse incoming term
         incoming_term: Optional[int] = None
         try:
             if term is not None:
@@ -280,7 +303,7 @@ class ChatServer:
         except Exception:
             incoming_term = None
 
-        # 2) Merge/add servers from incoming list (no removals yet)
+        # Merge servers from incoming list (no removals yet)
         if isinstance(servers, list):
             for s in servers:
                 info = self._serverinfo_from_dict(s)
@@ -293,6 +316,7 @@ class ChatServer:
                 if info.id == self.server_id:
                     continue
 
+                # Add or update server
                 if info.id not in self.membership or self.membership[info.id] != info:
                     self.membership[info.id] = info
                     changed = True
@@ -303,17 +327,17 @@ class ChatServer:
 
         incoming_ids.add(self.server_id)
 
-        # 3) If term is newer, adopt it and clear election state
+        # If term is newer, adopt it and clear election state
         if incoming_term is not None and incoming_term > self.term:
             self.term = incoming_term
             self.in_election = False
             self._election_term = 0
             changed = True
 
-        # 4) FIX: Update leader ONLY from authoritative leader-issued snapshots.
+        # Update leader only from authoritative leader-issued snapshots
         # Prevents followers from adopting a stale/incorrect leader_id from random senders.
         if (
-            mtype in ("MEMBERSHIP", "SERVER_WELCOME")
+            mtype in ("MEMBERSHIP", "SERVER_WELCOME") # leader-issued messages
             and isinstance(sender, str)
             and isinstance(leader_id, str)
             and sender == leader_id
@@ -324,11 +348,13 @@ class ChatServer:
             self.leader_id = leader_id
             changed = True
 
-        # 5) Merge room ownership / ports / load for current-or-newer term
+        # Merge room ownership / ports / load for current or newer term
         if incoming_term is not None and incoming_term >= self.term:
             if isinstance(room_owner, dict):
+                # keep rooms owned by alive servers
                 filtered = {str(r): str(sid) for r, sid in room_owner.items() if str(sid) in self.membership}
                 if filtered != self.room_owner:
+                    # if different from current state, update
                     self.room_owner = filtered
                     changed = True
 
@@ -347,34 +373,37 @@ class ChatServer:
                 new_load: Dict[str, int] = {}
                 for sid, v in server_load.items():
                     sid_s = str(sid)
-                    if sid_s in self.membership:
+                    if sid_s in self.membership: # only alive servers
                         try:
                             new_load[sid_s] = int(v)
                         except Exception:
                             pass
                 if new_load:
+                    # preserve my own load count
                     new_load.setdefault(self.server_id, self.server_load.get(self.server_id, 0))
                     if new_load != self.server_load:
                         self.server_load = new_load
                         changed = True
 
-        # 6) Prune stale members using leader-authoritative membership snapshots
+        # Prune stale members using leader-authoritative membership snapshots
         if (
             mtype in ("MEMBERSHIP", "SERVER_WELCOME")
             and isinstance(sender, str)
-            and sender == self.leader_id
+            and sender == self.leader_id # only leader can prune
             and incoming_term is not None
-            and incoming_term == self.term
+            and incoming_term == self.term # must be current term
         ):
+            # Remove servers not in incoming snapshot
             stale_ids = [sid for sid in list(self.membership.keys()) if sid not in incoming_ids]
             for sid in stale_ids:
                 if sid == self.server_id:
-                    continue
+                    continue # never remove self
                 self.membership.pop(sid, None)
                 self.last_seen.pop(sid, None)
                 self.server_load.pop(sid, None)
                 changed = True
 
+            # Clean up rooms owned by removed servers
             filtered_rooms = {r: sid for r, sid in self.room_owner.items() if sid in self.membership}
             if filtered_rooms != self.room_owner:
                 self.room_owner = filtered_rooms
@@ -442,6 +471,7 @@ class ChatServer:
             return
         loop = asyncio.get_running_loop()
         try:
+            # Send UDP control message
             await loop.sock_sendto(
                 self._ctrl_send_sock,
                 json.dumps(msg).encode("utf-8"),
@@ -478,10 +508,13 @@ class ChatServer:
         }
         await self._send_control_to_server(succ, msg)
 
-    # -----------------------------
-    # UDP server control listener
-    # -----------------------------
+
     async def server_control_listener(self) -> None:
+        """
+        UDP server control listener
+        Listens for and processes all server-to-server control messages
+        """
+        # Create UDP socket for receiving control messages
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(("", SERVER_CONTROL_PORT))
@@ -489,26 +522,31 @@ class ChatServer:
 
         loop = asyncio.get_running_loop()
         while True:
-            data, addr = await loop.sock_recvfrom(sock, 65535)
+            # Receive UDP messages
+            data, addr = await loop.sock_recvfrom(sock, 65535) # max UDP datagram size
             try:
                 msg = json.loads(data.decode("utf-8"))
             except json.JSONDecodeError:
                 continue
 
+            # Message processing
             mtype = msg.get("type")
             sender_id = msg.get("from") or msg.get("id")
             if isinstance(sender_id, str) and sender_id:
-                self._touch(sender_id)
+                self._touch(sender_id) # update last_seen timestamp
 
             if mtype == "SERVER_HELLO":
+                # New server announcement
                 info = self._serverinfo_from_dict(msg)
                 if info and info.id != self.server_id:
                     changed = False
+                    # Add new server to membership
                     if info.id not in self.membership or self.membership[info.id] != info:
                         self.membership[info.id] = info
                         self.server_load.setdefault(info.id, 0)
                         changed = True
 
+                    # Reply with current membership snapshot
                     welcome = self._membership_payload("SERVER_WELCOME")
                     await loop.sock_sendto(sock, json.dumps(welcome).encode("utf-8"), addr)
 
@@ -516,15 +554,17 @@ class ChatServer:
                         self._print_membership()
 
             elif mtype in ("SERVER_WELCOME", "MEMBERSHIP"):
+                # Sync state
                 changed = self._merge_membership(msg)
                 if changed:
+                    # Start room servers for newly owned rooms
                     for room, owner in self.room_owner.items():
                         if owner == self.server_id:
                             await self._ensure_local_room_server(room)
                     self._print_membership()
 
             elif mtype in ("LEADER_HEARTBEAT", "ALIVE"):
-                pass
+                pass # last_seen already updated above
 
             elif mtype == "ELECTION":
                 try:
@@ -541,7 +581,9 @@ class ChatServer:
                 self.in_election = True
                 self._election_term = max(self._election_term, term)
 
+                # The message makes a full round
                 if cand == self.server_id:
+                    # I am the winner
                     self.term = term
                     self.leader_id = self.server_id
                     self.in_election = False
@@ -550,6 +592,7 @@ class ChatServer:
                     print(f"[ELECTION] WIN leader={self.server_id[:8]} term={term} -> sending ELECTED")
                     self._print_membership()
 
+                    # Announce elected leader
                     succ = self._ring_successor_id()
                     if succ:
                         await self._send_control_to_server(
@@ -558,6 +601,7 @@ class ChatServer:
                         )
                     continue
 
+                # Forward election message with highest candidate ID
                 next_cand = cand if cand > self.server_id else self.server_id
                 succ = self._ring_successor_id()
                 if succ:
@@ -591,9 +635,11 @@ class ChatServer:
                 if not already_seen:
                     self._print_membership()
 
+                # Stop forwarding if I'm the leader and already seen
                 if self.server_id == leader_id and already_seen:
                     continue
-
+                
+                # Forward to next server in ring
                 succ = self._ring_successor_id()
                 if succ:
                     print(f"[ELECTION] FWD ELECTED term={term} leader={leader_id[:8]} -> succ={succ[:8]}")
@@ -603,6 +649,7 @@ class ChatServer:
                     )
 
     async def broadcast_server_hello(self) -> None:
+        # Announce new server joining via UDP broadcast
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -620,6 +667,7 @@ class ChatServer:
         payload = json.dumps(hello).encode("utf-8")
         bcast_addr = ("255.255.255.255", SERVER_CONTROL_PORT)
 
+        # broadcast 3 times for reliability
         for _ in range(3):
             try:
                 await loop.sock_sendto(sock, payload, bcast_addr)
@@ -629,14 +677,21 @@ class ChatServer:
         sock.close()
 
     async def leader_gossip_loop(self) -> None:
+        """
+        Leader broadcasts membership snapshots to all followers periodically
+        """
         await asyncio.sleep(1.0)
         loop = asyncio.get_running_loop()
         while True:
             await asyncio.sleep(LEADER_GOSSIP_INTERVAL)
             if self.leader_id != self.server_id:
                 continue
+
+            # Create membership snapshot
             msg = self._membership_payload("MEMBERSHIP")
             payload = json.dumps(msg).encode("utf-8")
+
+            # Send to all followers
             for sid, sinfo in list(self.membership.items()):
                 if sid == self.server_id:
                     continue
@@ -654,6 +709,8 @@ class ChatServer:
                 continue
             hb = {"type": "LEADER_HEARTBEAT", "from": self.server_id, "leader_id": self.leader_id, "term": self.term, "ts": now()}
             payload = json.dumps(hb).encode("utf-8")
+
+            # Broadcast heartbeat to all followers
             for sid, sinfo in list(self.membership.items()):
                 if sid == self.server_id:
                     continue
@@ -674,6 +731,8 @@ class ChatServer:
                 continue
             msg = {"type": "ALIVE", "from": self.server_id, "leader_id": self.leader_id, "term": self.term, "ts": now()}
             payload = json.dumps(msg).encode("utf-8")
+
+            # Unicast ALIVE to leader
             try:
                 await loop.sock_sendto(self._ctrl_send_sock, payload, leader_ep)
             except Exception:
@@ -688,6 +747,7 @@ class ChatServer:
             return
 
         print(f"[COORD] Reassigning {len(rooms_to_move)} room(s) from dead server {dead_sid[:8]}.")
+        # Reassign each room to least-loaded alive server
         for room in rooms_to_move:
             new_owner = min(alive_ids, key=lambda sid: (self.server_load.get(sid, 0), sid))
             self.room_owner[room] = new_owner
@@ -697,9 +757,7 @@ class ChatServer:
         while True:
             await asyncio.sleep(1.0)
 
-            # ---------------------------
             # FOLLOWER: only suspect leader
-            # ---------------------------
             if self.leader_id != self.server_id:
                 last = self.last_seen.get(self.leader_id, 0.0)
                 if now() - last > FAILURE_TIMEOUT:
@@ -718,14 +776,13 @@ class ChatServer:
                         continue
 
                     self._print_membership()
+                    # Start election
                     await self._lcr_start_election(reason="leader_timeout")
 
                 # Followers must NOT prune other servers
                 continue
 
-            # ---------------------------
             # LEADER: prune timed-out members
-            # ---------------------------
             to_remove: List[str] = []
             for sid in list(self.membership.keys()):
                 if sid == self.server_id:
@@ -737,6 +794,7 @@ class ChatServer:
             if not to_remove:
                 continue
 
+            # Remove dead servers
             for sid in to_remove:
                 if sid in self.membership:
                     print(f"[FAILURE] Removing server {sid[:8]} from membership (timeout).")
@@ -757,6 +815,7 @@ class ChatServer:
         await writer.drain()
 
     async def _handle_coordinator_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        """Handles client JOIN_REQUEST on the coordinator port"""
         peer = writer.get_extra_info("peername")
         print(f"[COORD] Client connected: {peer}")
 
@@ -780,7 +839,9 @@ class ChatServer:
                     continue
                 room = room.strip()
 
+                # Only leader can assign room ownership
                 if self.leader_id != self.server_id:
+                    # Follower: redirect to leader
                     leader_ep = self._leader_endpoint()
                     if leader_ep:
                         await self._send_tcp(
@@ -791,6 +852,7 @@ class ChatServer:
                         await self._send_tcp(writer, {"type": "ERROR", "message": "Leader unknown."})
                     continue
 
+                # Leader: assign room to server
                 owner_sid = self._choose_server_for_room(room)
                 port = self._ensure_room_port_assigned(room, owner_sid)
                 owner_info = self.membership.get(owner_sid)
